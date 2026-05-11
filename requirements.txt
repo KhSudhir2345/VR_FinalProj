@@ -1,0 +1,8 @@
+streamlit
+torch
+torchvision
+open-clip-torch
+hnswlib
+pillow
+ultralytics
+pandas
