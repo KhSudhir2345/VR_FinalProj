@@ -1,32 +1,48 @@
+import os
+
+# HuggingFace cache
+os.environ["HF_HOME"] = "D:/VR_Final_Proj/hf_cache"
+os.environ["TRANSFORMERS_CACHE"] = "D:/VR_Final_Proj/hf_cache"
+os.environ["TORCH_HOME"] = "D:/VR_Final_Proj/torch_cache"
+os.environ["HF_DATASETS_CACHE"] = "D:/VR_Final_Proj/hf_datasets_cache"
+
 import streamlit as st
 import torch
 import torch.nn.functional as F
+from PIL import Image
+import json
 import open_clip
 import hnswlib
-import json
-import os
-from PIL import Image
-from ultralytics import YOLO
+from transformers import pipeline # <-- NEW: Hugging Face Pipeline
+from lavis.models import load_model_and_preprocess
 
-# --- APP CONFIG ---
-st.set_page_config(page_title="AI Fashion Search", layout="wide")
+# --- 1. SETUP & DEVICE ---
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# HF pipelines use 0 for the first GPU, and -1 for CPU
+HF_DEVICE = 0 if DEVICE == "cuda" else -1
 
-# Automatically use GPU if available, otherwise CPU
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-# --- CACHED AI LOADING ---
-# @st.cache_resource prevents reloading the heavy models every time the user clicks
+# --- 2. PIPELINE LOADER ---
 @st.cache_resource
 def load_ai_pipeline():
-    # 1. Load Fine-Tuned CLIP
+    """
+    Loads all models, databases, and captions into memory once.
+    """
+    # ---------------------------------------------------------
+    # 1. LOAD FINE-TUNED CLIP (Stage 1 Encoder)
+    # ---------------------------------------------------------
     model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
     model.load_state_dict(torch.load("models/clip_ft_C_seed546_best.pt", map_location=DEVICE))
     model = model.to(DEVICE).eval()
     
-    # 2. Load YOLO (will auto-download yolov8n.pt if missing)
-    yolo = YOLO('yolov8n.pt')
+    # ---------------------------------------------------------
+    # 2. LOAD HUGGING FACE FASHION DETECTOR (Replaces YOLO)
+    # ---------------------------------------------------------
+    # Fine-tuned on Fashionpedia - recognizes 40+ distinct garment types
+    fashion_detector = pipeline("object-detection", model="valentinafeve/yolos-fashionpedia", device=HF_DEVICE)
     
-    # 3. Load HNSW Index & Metadata
+    # ---------------------------------------------------------
+    # 3. LOAD HNSW INDEX & METADATA (Stage 1 Database)
+    # ---------------------------------------------------------
     idx = hnswlib.Index(space='cosine', dim=512)
     idx.load_index("index/config_C/hnsw.bin")
     idx.set_ef(150)
@@ -34,29 +50,45 @@ def load_ai_pipeline():
     meta = json.load(open("index/config_C/config.json"))
     gallery_paths = meta['paths']
     
-    return model, preprocess, yolo, idx, gallery_paths
+    # ---------------------------------------------------------
+    # 4. LOAD BLIP-2 ITM (Lightweight Re-ranker)
+    # ---------------------------------------------------------
+    blip_model, vis_processors, text_processors = load_model_and_preprocess(
+        name="blip2_image_text_matching",
+        model_type="pretrain",
+        is_eval=True,
+        device=DEVICE
+    )
+    
+    # ---------------------------------------------------------
+    # 5. LOAD CAPTIONS
+    # ---------------------------------------------------------
+    captions_path = os.path.join("safe_captions", "captions", "captions.json")
+    with open(captions_path, "r") as f:
+        raw_captions = json.load(f)
+        
+    gallery_captions = []
+    for path in gallery_paths:
+        clean_path = path.replace("\\", "/") 
+        caption = raw_captions.get(clean_path, "A piece of clothing") 
+        gallery_captions.append(caption)
 
-# --- MAIN UI ---
-st.title("👗 AI Fashion Search Engine")
-st.write("Upload a photo of an outfit to find visually similar items in our database.")
+    # Return fashion_detector instead of yolo
+    return model, preprocess, fashion_detector, idx, gallery_paths, blip_model, vis_processors, text_processors, gallery_captions
 
-with st.spinner("Warming up AI Models..."):
-    model, preprocess, yolo, idx, gallery_paths = load_ai_pipeline()
+# --- 3. MAIN UI ---
+st.set_page_config(layout="wide", page_title="AI Fashion Search")
+st.title("👗 AI Fashion Search Engine (Two-Stage Retrieval)")
+st.write("Upload a photo of an outfit to find visually and semantically similar items.")
+
+with st.spinner("Warming up AI Models... (This takes a minute on startup)"):
+    # Unpack the new fashion_detector
+    model, preprocess, fashion_detector, idx, gallery_paths, blip_model, vis_processors, text_processors, gallery_captions = load_ai_pipeline()
 
 # File Uploader
 uploaded_file = st.file_uploader("Upload an image (JPG/PNG)", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    # 1. The original YOLO toggle
-    use_yolo = st.checkbox("Use YOLO Auto-Cropping", value=True, help="Turn this off if your image is already a clean photo.")
-    
-    # 2. >>> NEW: The TA's Requirement - Radio Buttons <<<
-    search_focus = st.radio(
-        "What do you want to search for?",
-        ["Full Body (Default)", "Upper Body (Shirts/Jackets)", "Lower Body (Pants/Skirts)"],
-        horizontal=True
-    )
-
     col1, col2 = st.columns([1, 2])
     
     with col1:
@@ -65,65 +97,126 @@ if uploaded_file is not None:
         st.image(query_image, use_container_width=True)
         
     with col2:
-        st.subheader("Top Matches")
-        with st.spinner("Analyzing and searching..."):
+        st.subheader("Garment Selection")
+        
+        # --- 1. RUN THE FASHION DETECTOR ---
+        with st.spinner("Scanning image for specific clothing items..."):
+            detections = fashion_detector(query_image)
             
-            crop = query_image # Default to the full image
+        # --- 2. BUILD THE OPTIONS LIST ---
+        # These 3 manual options will ALWAYS be in the list
+        options = [
+            "Full Body (Default)", 
+            "Upper Body (Top 60%)", 
+            "Lower Body (Bottom 55%)"
+        ]
+        
+        # If the AI found anything, add ALL of them to the list!
+        if detections:
+            st.success(f"Found {len(detections)} distinct garment(s) via AI!")
+            ai_options = [f"AI Detected: {d['label']} ({int(d['score']*100)}% confidence)" for d in detections]
+            options.extend(ai_options) # Add AI options to the end of the manual options
+        else:
+            st.warning("No distinct clothing items detected by AI. Please use a manual selection.")
+
+        st.write("### Which item would you like to search for?")
+        
+        # --- 3. DISPLAY THE RADIO BUTTONS ---
+        selected_option = st.radio("Select Target:", options)
+        
+        # --- 4. EXECUTE THE CROP BASED ON SELECTION ---
+        W, H = query_image.size
+        
+        if selected_option == "Full Body (Default)":
+            crop = query_image
             
-            # 1. Optional YOLO Cropping
-            if use_yolo:
-                results = yolo(query_image, verbose=False)
-                boxes = results[0].boxes
-                best_box, best_area = None, 0
-                
-                # Find the largest person in the photo
-                for i, cls in enumerate(boxes.cls.cpu().numpy()):
-                    if int(cls) == 0:  # Class 0 is 'person'
-                        x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
-                        area = (x2 - x1) * (y2 - y1)
-                        if area > best_area:
-                            best_area = area
-                            best_box = (int(x1), int(y1), int(x2), int(y2))
-                
-                # >>> NEW: Geometric Math to slice the box <<<
-                if best_box:
-                    x1, y1, x2, y2 = best_box
-                    box_height = y2 - y1
-                    
-                    if "Upper Body" in search_focus:
-                        # Keep the top 60% of the box (Head to waist)
-                        y2 = y1 + (box_height * 0.60)
-                    elif "Lower Body" in search_focus:
-                        # Keep the bottom 55% of the box (Waist to feet)
-                        y1 = y1 + (box_height * 0.45)
-                    
-                    # Apply the final crop!
-                    crop = query_image.crop((int(x1), int(y1), int(x2), int(y2)))
+        elif selected_option == "Upper Body (Top 60%)":
+            crop = query_image.crop((0, 0, W, int(H * 0.60)))
             
-            # Show the user exactly what the AI is about to search for
-            with col1:
-                st.write("**What the AI is actually searching for:**")
-                st.image(crop, width=150)
+        elif selected_option == "Lower Body (Bottom 55%)":
+            crop = query_image.crop((0, int(H * 0.45), W, H))
             
-            # 2. Extract Features
-            x = preprocess(crop).unsqueeze(0).to(DEVICE)
+        else:
+            # If it's none of the manual ones, it MUST be an AI option.
+            # We subtract 3 because the first 3 items in the 'options' list are the manual ones.
+            ai_index = options.index(selected_option) - 3 
+            best_box = detections[ai_index]['box']
+            crop = query_image.crop((best_box['xmin'], best_box['ymin'], best_box['xmax'], best_box['ymax']))
+        
+        # --- 5. SHOW THE RESULT TO THE USER ---
+        with col1:
+            st.write("**Isolated Search Target:**")
+            st.image(crop, width=200)
+            
+    # ==========================================
+    # TWO-STAGE RETRIEVAL PIPELINE
+    # ==========================================
+    st.subheader("Top Matches")
+    
+    with st.spinner("Stage 1: Fast HNSW Retrieval..."):
+        # 1. Extract CLIP Features
+        x = preprocess(crop).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            emb = F.normalize(model.encode_image(x), dim=-1).cpu().numpy().squeeze()
+        
+        # 2. Grab Top 15
+        labels, distances = idx.knn_query(emb, k=15) 
+        
+    with st.spinner("Stage 2: Semantic Re-ranking... (Fast ITM)"):
+        reranked_results = []
+        
+        for label in labels[0]:
+            candidate_path = gallery_paths[label]
+            candidate_caption = gallery_captions[label]
+            
+            # Use BLIP-2 specifically for Image-Text Matching
+            image = vis_processors["eval"](crop).unsqueeze(0).to(DEVICE)
+            text = text_processors["eval"](candidate_caption)
+
+            sample = {
+                "image": image,
+                "text_input": [text]
+            }
+
             with torch.no_grad():
-                emb = F.normalize(model.encode_image(x), dim=-1).cpu().numpy().squeeze()
+                itm_output = blip_model(sample, match_head="itm")
+                itm_probs = torch.nn.functional.softmax(itm_output, dim=1)
+                itm_match_probability = itm_probs[:, 1].item()
             
-            # 3. Search the Database
-            labels, distances = idx.knn_query(emb, k=6)
+            reranked_results.append({
+                "path": candidate_path,
+                "caption": candidate_caption,
+                "score": itm_match_probability
+            })
+        
+        # Sort Top 15 by BLIP-2 Score
+        reranked_results.sort(key=lambda x: x["score"], reverse=True)
+        final_top_10 = reranked_results[:10]
             
-            # 4. Display Results
-            result_cols = st.columns(3)
-            for i, label in enumerate(labels[0]):
-                original_path = gallery_paths[label]
-                filename = original_path.replace("/", "__")
-                local_image_path = os.path.join("gallery_images", filename)
-                
-                with result_cols[i % 3]:
-                    try:
-                        res_img = Image.open(local_image_path)
-                        st.image(res_img, use_container_width=True)
-                        st.caption(f"Match {i+1} (Score: {1 - distances[0][i]:.2f})")
-                    except FileNotFoundError:
-                        st.error(f"Missing: {filename}")
+    # --- DISPLAY RESULTS (THE FLAT FOLDER WAY) ---
+    # Notice this is lined up with 'col1, col2 = st.columns([1, 2])'
+    # It sits outside the 'with col2:' block so it spans the whole screen!
+    
+    st.markdown("---") # Adds a nice visual line break
+    st.subheader("Visual Matches (Original Dataset Images)")
+    
+    result_cols = st.columns(5) # 5 columns for the Top 10
+    for i, result in enumerate(final_top_10):
+        
+        # 1. Convert database path to the double-underscore flat name
+        safe_filename = result["path"].replace("/", "__").replace("\\", "__")
+        
+        # Add 'img__' if your flat folder uses it
+        if not safe_filename.startswith("img__"):
+            safe_filename = "img__" + safe_filename
+        
+        # 2. Point directly to your NEW flat folder of full images!
+        local_image_path = os.path.join("gallery_images_full", safe_filename)
+        
+        with result_cols[i % 5]:
+            try:
+                res_img = Image.open(local_image_path)
+                st.image(res_img, use_container_width=True)
+                st.caption(f"**Rank {i+1}** (Score: {result['score']:.3f})")
+            except FileNotFoundError:
+                st.error(f"Missing: {safe_filename}")
